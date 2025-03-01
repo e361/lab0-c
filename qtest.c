@@ -172,9 +172,11 @@ static void fill_rand_string(char *buf, size_t buf_size)
     while (len < MIN_RANDSTR_LEN)
         len = rand() % buf_size;
 
-    randombytes((uint8_t *) buf, len);
+    uint64_t randstr_buf_64[MAX_RANDSTR_LEN] = {0};
+    randombytes((uint8_t *) randstr_buf_64, len * sizeof(uint64_t));
     for (size_t n = 0; n < len; n++)
-        buf[n] = charset[buf[n] % (sizeof(charset) - 1)];
+        buf[n] = charset[randstr_buf_64[n] % (sizeof(charset) - 1)];
+
     buf[len] = '\0';
 }
 
@@ -540,11 +542,6 @@ static bool do_size(int argc, char *argv[])
 
     int reps = 1;
     bool ok = true;
-    if (argc != 1 && argc != 2) {
-        report(1, "%s needs 0-1 arguments", argv[0]);
-        return false;
-    }
-
     if (argc == 2) {
         if (!get_int(argv[1], &reps))
             report(1, "Invalid number of calls to size '%s'", argv[2]);
@@ -598,6 +595,23 @@ bool do_sort(int argc, char *argv[])
     error_check();
 
     set_noallocate_mode(true);
+
+/* If the number of elements is too large, it may take a long time to check the
+ * stability of the sort. So, MAX_NODES is used to limit the number of elements
+ * to check the stability of the sort. */
+#define MAX_NODES 100000
+    struct list_head *nodes[MAX_NODES];
+    unsigned no = 0;
+    if (current && current->size && current->size <= MAX_NODES) {
+        element_t *entry;
+        list_for_each_entry (entry, current->q, list)
+            nodes[no++] = &entry->list;
+    } else if (current && current->size > MAX_NODES)
+        report(1,
+               "Warning: Skip checking the stability of the sort because the "
+               "number of elements %d is too large, exceeds the limit %d.",
+               current->size, MAX_NODES);
+
     if (current && exception_setup(true))
         q_sort(current->q, descend);
     exception_cancel();
@@ -622,8 +636,32 @@ bool do_sort(int argc, char *argv[])
                 ok = false;
                 break;
             }
+            /* Ensure the stability of the sort */
+            if (current->size <= MAX_NODES &&
+                !strcmp(item->value, next_item->value)) {
+                bool unstable = false;
+                for (unsigned i = 0; i < MAX_NODES; i++) {
+                    if (nodes[i] == cur_l->next) {
+                        unstable = true;
+                        break;
+                    }
+                    if (nodes[i] == cur_l) {
+                        break;
+                    }
+                }
+                if (unstable) {
+                    report(
+                        1,
+                        "ERROR: Not stable sort. The duplicate strings \"%s\" "
+                        "are not in the same order.",
+                        item->value);
+                    ok = false;
+                    break;
+                }
+            }
         }
     }
+#undef MAX_NODES
 
     q_show(3);
     return ok && !error_check();
@@ -878,17 +916,23 @@ static bool do_merge(int argc, char *argv[])
 static bool is_circular()
 {
     struct list_head *cur = current->q->next;
+    struct list_head *fast = (cur) ? cur->next : NULL;
     while (cur != current->q) {
-        if (!cur)
+        if (!cur || !fast || !fast->next)
+            return false;
+        if (cur == fast)
             return false;
         cur = cur->next;
+        fast = fast->next->next;
     }
 
     cur = current->q->prev;
+    fast = (cur) ? cur->prev : NULL;
     while (cur != current->q) {
-        if (!cur)
+        if (!cur || !fast || !fast->prev)
             return false;
         cur = cur->prev;
+        fast = fast->prev->prev;
     }
     return true;
 }
@@ -1129,6 +1173,129 @@ static void usage(char *cmd)
     exit(0);
 }
 
+extern char **environ;
+
+/* Returns true if the hash is exactly 40 hexadecimal characters. */
+static inline bool is_valid_sha1(const char *hash)
+{
+    size_t len = strlen(hash);
+    if (len != 40)
+        return false;
+    for (size_t i = 0; i < len; i++) {
+        char c = hash[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Checks if a specific SHA-1 commit exists in the git log. */
+bool commit_exists(const char *commit_hash)
+{
+    /* Verify the commit_hash is a valid SHA-1 hash */
+    if (!is_valid_sha1(commit_hash))
+        return false;
+
+    int pipefd[2];
+    if (pipe(pipefd) == -1) {
+        /* Error creating pipe */
+        perror("pipe");
+        return false;
+    }
+
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        /* Error initializing spawn file actions */
+        perror("posix_spawn_file_actions_init");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return false;
+    }
+
+    /* Redirect child's stdout to the pipe's write end */
+    if (posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO) !=
+        0) {
+        perror("posix_spawn_file_actions_adddup2");
+        posix_spawn_file_actions_destroy(&actions);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return false;
+    }
+
+    /* Close unused pipe ends in the child */
+    if (posix_spawn_file_actions_addclose(&actions, pipefd[0]) != 0 ||
+        posix_spawn_file_actions_addclose(&actions, pipefd[1]) != 0) {
+        perror("posix_spawn_file_actions_addclose");
+        posix_spawn_file_actions_destroy(&actions);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return false;
+    }
+
+    pid_t pid;
+    /* Use "--no-abbrev-commit" to ensure full SHA-1 hash is printed */
+    char *argv[] = {
+        "git", "log", "--pretty=oneline", "--no-abbrev-commit", NULL,
+    };
+    int spawn_ret = posix_spawnp(&pid, "git", &actions, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (spawn_ret != 0) {
+        /* Error spawning git process */
+        fprintf(stderr, "posix_spawnp failed: %s\n", strerror(spawn_ret));
+        close(pipefd[0]);
+        return false;
+    }
+
+    /* Parent process: close the write end of the pipe */
+    close(pipefd[1]);
+
+    FILE *stream = fdopen(pipefd[0], "r");
+    if (!stream) {
+        /* Error converting file descriptor to stream */
+        perror("fdopen");
+        return false;
+    }
+
+    bool found = false;
+    char buffer[1024];
+    while (fgets(buffer, sizeof(buffer), stream)) {
+        /* Compare the first 40 characters of each line with commit_hash */
+        if (!strncmp(buffer, commit_hash, 40)) {
+            found = true;
+            break;
+        }
+    }
+    fclose(stream);
+
+    /* Wait for the child process to finish */
+    int status;
+    waitpid(pid, &status, 0);
+
+    return found;
+}
+
+static bool check_commitlog(void)
+{
+    pid_t pid;
+    int status;
+    char *script_path = "scripts/check-commitlog.sh";
+    char *argv[] = {script_path, NULL};
+
+    int spawn_ret = posix_spawnp(&pid, script_path, NULL, NULL, argv, environ);
+    if (spawn_ret != 0)
+        return false;
+
+    if (waitpid(pid, &status, 0) == -1)
+        return false;
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        return false;
+
+    return true;
+}
+
 #define GIT_HOOK ".git/hooks/"
 static bool sanity_check()
 {
@@ -1158,6 +1325,25 @@ static bool sanity_check()
         }
         return false;
     }
+    /* GitHub Actions checkouts do not include the complete git history. */
+    if (stat("/home/runner/work", &buf)) {
+#define COPYRIGHT_COMMIT_SHA1 "50c5ac53d31adf6baac4f8d3db6b3ce2215fee40"
+        if (!commit_exists(COPYRIGHT_COMMIT_SHA1)) {
+            fprintf(
+                stderr,
+                "FATAL: The repository is outdated. Please update properly.\n");
+            return false;
+        }
+        if (!check_commitlog()) {
+            fprintf(stderr, "FATAL: The git commit history is chaotic.\n");
+            fprintf(stderr,
+                    "Please install the required git hooks per the assignment "
+                    "instructions and make your commits from the terminal "
+                    "instead of using the GitHub web interface.\n");
+            return false;
+        }
+    }
+
     return true;
 }
 
